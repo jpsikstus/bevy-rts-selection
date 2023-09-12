@@ -101,7 +101,6 @@ fn setup(
 
     let unit_mesh = Mesh::from(Capsule::default());
     let unit_aabb = unit_mesh.compute_aabb().unwrap();
-
     let unit_mesh = meshes.add(unit_mesh);
 
     let large_unit_mesh = Mesh::from(Capsule {
@@ -109,7 +108,6 @@ fn setup(
         ..default()
     });
     let large_unit_aabb = large_unit_mesh.compute_aabb().unwrap();
-
     let large_unit_mesh = meshes.add(large_unit_mesh);
 
     for (x, y, z) in [(8.0, 2.2, 0.0), (5.0, 5.0, 8.0), (-2.0, 1.2, 3.0)] {
@@ -176,10 +174,6 @@ fn box_select(
     selected: Query<Entity, With<Selected>>,
 ) {
     for event in selection_events.iter() {
-        for entity in selected.iter() {
-            commands.entity(entity).remove::<Selected>();
-        }
-
         let (camera, camera_transform) = camera.single();
 
         let rays = [
@@ -195,9 +189,12 @@ fn box_select(
 
         let collider = generate_selection_collider(near, far);
 
+        let mut to_select = Vec::new();
+
         for (entity, transform, selectable) in selectables.iter() {
             let selectable_collider = aabb_collider(selectable.size);
             let selectable_position = vec3_to_isometry(transform.translation());
+
             let hit = parry3d::query::intersection_test(
                 &selectable_position,
                 &selectable_collider,
@@ -206,8 +203,14 @@ fn box_select(
             );
 
             if let Ok(true) = hit {
-                commands.entity(entity).insert(Selected);
+                to_select.push(entity);
             }
+        }
+        for entity in selected.iter().filter(|e| !to_select.contains(e)) {
+            commands.entity(entity).remove::<Selected>();
+        }
+        for entity in to_select.iter() {
+            commands.entity(*entity).insert(Selected);
         }
     }
 }
