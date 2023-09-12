@@ -1,29 +1,14 @@
 use std::f32::consts::PI;
 
 use bevy::{
-    input::mouse::MouseButtonInput,
     prelude::{shape::Capsule, *},
-    window::close_on_esc,
-};
-use bevy_mod_raycast::{
-    DefaultRaycastingPlugin, RaycastMesh, RaycastMethod, RaycastPluginState, RaycastSource,
-    RaycastSystem,
+    window::{close_on_esc, PrimaryWindow},
 };
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
-
-#[derive(Reflect)]
-struct GroundRaycastSet;
-
-#[derive(Reflect)]
-struct SelectableRaycastSet;
-
-#[derive(Component)]
-struct Selectable {
-    radius: f32,
-}
-
-#[derive(Component)]
-struct Selected;
+use parry3d::{
+    na::{Isometry3, Point3},
+    shape::ConvexPolyhedron,
+};
 
 #[derive(Resource)]
 struct UnitMaterials {
@@ -35,42 +20,33 @@ struct UnitMaterials {
 struct BoxSelectionPosition(Option<Vec2>);
 
 #[derive(Event)]
-struct BoxSelect {
-    start: Vec2,
-    end: Vec2,
+struct BoxSelect(Rect);
+
+#[derive(Component)]
+struct Selectable {
+    size: Vec3,
 }
+
+#[derive(Component)]
+struct Selected;
 
 fn main() {
     App::new()
-        .add_plugins((
-            DefaultPlugins,
-            PanOrbitCameraPlugin,
-            DefaultRaycastingPlugin::<GroundRaycastSet>::default(),
-            DefaultRaycastingPlugin::<SelectableRaycastSet>::default(),
-        ))
-        .insert_resource(RaycastPluginState::<GroundRaycastSet>::default())
-        .insert_resource(RaycastPluginState::<SelectableRaycastSet>::default())
+        .add_plugins((DefaultPlugins, PanOrbitCameraPlugin))
         .insert_resource(BoxSelectionPosition::default())
         .add_event::<BoxSelect>()
         .add_systems(Startup, setup)
         .add_systems(
-            First,
-            update_raycast_with_cursor
-                .before(RaycastSystem::BuildRays::<GroundRaycastSet>)
-                .before(RaycastSystem::BuildRays::<SelectableRaycastSet>),
-        )
-        .add_systems(
             Update,
             (
                 close_on_esc,
-                add_raycast_mesh,
                 start_mouse_selection,
                 end_mouse_selection,
-                select_single,
                 box_select,
                 show_selection_box,
                 set_selected_unit_material,
                 set_unselected_unit_material,
+                show_debug_shapes,
             ),
         )
         .run();
@@ -80,7 +56,6 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    asset_server: Res<AssetServer>,
 ) {
     // Camera
     commands.spawn((
@@ -93,8 +68,6 @@ fn setup(
             button_orbit: MouseButton::Right,
             ..default()
         },
-        RaycastSource::<GroundRaycastSet>::new(),
-        RaycastSource::<SelectableRaycastSet>::new(),
     ));
 
     // Light
@@ -109,27 +82,35 @@ fn setup(
     });
 
     // Ground
-    commands.spawn((SceneBundle {
-        scene: asset_server.load("ground.glb#Scene0"),
+    commands.spawn(PbrBundle {
+        mesh: meshes.add(Mesh::from(shape::Plane {
+            size: 100.0,
+            ..default()
+        })),
+        material: materials.add(Color::DARK_GREEN.into()),
         ..default()
-    },));
+    });
 
     // Units
-    let unit_mesh = meshes.add(Capsule::default().into());
-    let large_unit_mesh = meshes.add(
-        Capsule {
-            radius: 1.0,
-            ..default()
-        }
-        .into(),
-    );
-
     let unit_material = materials.add(Color::GRAY.into());
 
     commands.insert_resource(UnitMaterials {
         normal: unit_material.clone(),
         selected: materials.add(Color::BLUE.into()),
     });
+
+    let unit_mesh = Mesh::from(Capsule::default());
+    let unit_aabb = unit_mesh.compute_aabb().unwrap();
+
+    let unit_mesh = meshes.add(unit_mesh);
+
+    let large_unit_mesh = Mesh::from(Capsule {
+        radius: 1.0,
+        ..default()
+    });
+    let large_unit_aabb = large_unit_mesh.compute_aabb().unwrap();
+
+    let large_unit_mesh = meshes.add(large_unit_mesh);
 
     for (x, y, z) in [(8.0, 2.2, 0.0), (5.0, 5.0, 8.0), (-2.0, 1.2, 3.0)] {
         commands.spawn((
@@ -139,8 +120,9 @@ fn setup(
                 material: unit_material.clone(),
                 ..default()
             },
-            Selectable { radius: 0.5 },
-            RaycastMesh::<SelectableRaycastSet>::default(),
+            Selectable {
+                size: unit_aabb.half_extents.into(),
+            },
         ));
     }
 
@@ -151,97 +133,37 @@ fn setup(
             material: unit_material.clone(),
             ..default()
         },
-        Selectable { radius: 1.0 },
-        RaycastMesh::<SelectableRaycastSet>::default(),
+        Selectable {
+            size: large_unit_aabb.half_extents.into(),
+        },
     ));
 }
 
-// Update our `RaycastSource` with the current cursor position every frame.
-fn update_raycast_with_cursor(
-    mut cursor: EventReader<CursorMoved>,
-    mut ground_raycast_source: Query<&mut RaycastSource<GroundRaycastSet>>,
-    mut selectable_raycast_source: Query<&mut RaycastSource<SelectableRaycastSet>>,
-) {
-    // Grab the most recent cursor event if it exists:
-    let Some(cursor_moved) = cursor.iter().last() else {
-        return;
-    };
-
-    for mut pick_source in &mut ground_raycast_source {
-        pick_source.cast_method = RaycastMethod::Screenspace(cursor_moved.position);
-    }
-
-    for mut pick_source in &mut selectable_raycast_source {
-        pick_source.cast_method = RaycastMethod::Screenspace(cursor_moved.position);
-    }
-}
-
-// Add raycast mesh to loaded ground scene
-fn add_raycast_mesh(
-    mut commands: Commands,
-    query: Query<Entity, (Added<Handle<Mesh>>, Without<Selectable>)>,
-) {
-    for entity in query.iter() {
-        commands
-            .entity(entity)
-            .insert(RaycastMesh::<GroundRaycastSet>::default());
-    }
-}
-
 fn start_mouse_selection(
-    mut mouse_events: EventReader<MouseButtonInput>,
+    buttons: Res<Input<MouseButton>>,
     mut selection: ResMut<BoxSelectionPosition>,
-    raycast_source: Query<&RaycastSource<GroundRaycastSet>>,
-    selectable_raycast_source: Query<&RaycastSource<SelectableRaycastSet>>,
+    window: Query<&Window, With<PrimaryWindow>>,
 ) {
-    if !selectable_raycast_source
-        .single()
-        .intersections()
-        .is_empty()
-    {
-        return;
-    }
-    let source = raycast_source.single();
-    for event in mouse_events.iter() {
-        if event.button == MouseButton::Left && event.state.is_pressed() {
-            if let Some((_, hit_data)) = source.intersections().first() {
-                let position = Vec2::new(hit_data.position().x, hit_data.position().z);
-                selection.0 = Some(position);
-            }
-        }
+    if buttons.just_pressed(MouseButton::Left) {
+        selection.0 = window.single().cursor_position();
     }
 }
 
 fn end_mouse_selection(
-    mut mouse_events: EventReader<MouseButtonInput>,
-    mut selection: ResMut<BoxSelectionPosition>,
     mut selection_events: EventWriter<BoxSelect>,
-    raycast_source: Query<&RaycastSource<GroundRaycastSet>>,
+    buttons: Res<Input<MouseButton>>,
+    mut selection: ResMut<BoxSelectionPosition>,
+    window: Query<&Window, With<PrimaryWindow>>,
 ) {
-    let source = raycast_source.single();
-    for event in mouse_events.iter() {
-        if event.button == MouseButton::Left && !event.state.is_pressed() && selection.0.is_some() {
-            if let Some((_, hit_data)) = source.intersections().first() {
-                let start = selection.0.unwrap();
-                selection_events.send(BoxSelect {
-                    start,
-                    end: Vec2::new(hit_data.position().x, hit_data.position().z),
-                });
+    if buttons.just_released(MouseButton::Left) {
+        if let Some(selection_position) = selection.0 {
+            if let Some(cursor_position) = window.single().cursor_position() {
+                let rect = Rect::from_corners(cursor_position, selection_position);
+                if rect.size().x > 0.0 && rect.size().y > 0.0 {
+                    selection_events.send(BoxSelect(rect));
+                }
             }
             selection.0 = None;
-        }
-    }
-}
-
-fn select_single(
-    mut commands: Commands,
-    buttons: Res<Input<MouseButton>>,
-    raycast_source: Query<&RaycastSource<SelectableRaycastSet>>,
-) {
-    let source = raycast_source.single();
-    if buttons.just_pressed(MouseButton::Left) {
-        if let Some((entity, _)) = source.intersections().first() {
-            commands.entity(*entity).insert(Selected);
         }
     }
 }
@@ -249,20 +171,66 @@ fn select_single(
 fn box_select(
     mut commands: Commands,
     mut selection_events: EventReader<BoxSelect>,
-    units: Query<(Entity, &GlobalTransform, &Selectable)>,
+    camera: Query<(&Camera, &GlobalTransform)>,
+    selectables: Query<(Entity, &GlobalTransform, &Selectable)>,
+    selected: Query<Entity, With<Selected>>,
 ) {
     for event in selection_events.iter() {
-        for (entity, transform, unit) in units.iter() {
-            let position = Vec2::new(transform.translation().x, transform.translation().z);
-            let rect = Rect::from_corners(event.start, event.end);
+        for entity in selected.iter() {
+            commands.entity(entity).remove::<Selected>();
+        }
 
-            if rect_circle_intersect(rect, position, unit.radius) {
+        let (camera, camera_transform) = camera.single();
+
+        let rays = [
+            event.0.min,
+            Vec2::new(event.0.min.x, event.0.max.y),
+            event.0.max,
+            Vec2::new(event.0.max.x, event.0.min.y),
+        ]
+        .map(|point| camera.viewport_to_world(camera_transform, point).unwrap());
+
+        let near = rays.map(|ray| ray.origin);
+        let far = rays.map(|ray| ray.origin + ray.direction * 1000.0);
+
+        let collider = generate_selection_collider(near, far);
+
+        for (entity, transform, selectable) in selectables.iter() {
+            let selectable_collider = aabb_collider(selectable.size);
+            let selectable_position = vec3_to_isometry(transform.translation());
+            let hit = parry3d::query::intersection_test(
+                &selectable_position,
+                &selectable_collider,
+                &Isometry3::identity(),
+                &collider,
+            );
+
+            if let Ok(true) = hit {
                 commands.entity(entity).insert(Selected);
-            } else {
-                commands.entity(entity).remove::<Selected>();
             }
         }
     }
+}
+
+fn generate_selection_collider(near: [Vec3; 4], far: [Vec3; 4]) -> ConvexPolyhedron {
+    let points = near
+        .iter()
+        .chain(far.iter())
+        .map(|point| Point3::new(point.x, point.y, point.z))
+        .collect::<Vec<_>>();
+
+    ConvexPolyhedron::from_convex_hull(&points).unwrap()
+}
+
+fn aabb_collider(size: Vec3) -> parry3d::shape::Cuboid {
+    parry3d::shape::Cuboid::new([size.x, size.y, size.z].into())
+}
+
+fn vec3_to_isometry(position: Vec3) -> Isometry3<parry3d::math::Real> {
+    Isometry3::new(
+        [position.x, position.y, position.z].into(),
+        [0.0, 0.0, 0.0].into(),
+    )
 }
 
 fn set_selected_unit_material(
@@ -289,29 +257,72 @@ fn set_unselected_unit_material(
 fn show_selection_box(
     mut gizmos: Gizmos,
     selection: Res<BoxSelectionPosition>,
-    raycast_source: Query<&RaycastSource<GroundRaycastSet>>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform)>,
 ) {
-    let source = raycast_source.single();
-    let Some(start) = selection.0 else {
-        return;
-    };
-    let Some((_, hit_data)) = source.intersections().first() else {
-        return;
-    };
-    let end = Vec2::new(hit_data.position().x, hit_data.position().z);
-    let middle = (start + end) / 2.0;
-    let size = (start - end).abs();
+    if let Some(selection_position) = selection.0 {
+        if let Some(cursor_position) = window.single().cursor_position() {
+            let rect = Rect::from_corners(selection_position, cursor_position);
+            let (camera, camera_transform) = camera.single();
 
-    gizmos.rect(
-        Vec3::new(middle.x, 1.0, middle.y),
-        Quat::from_rotation_x(PI / 2.0),
-        size,
-        Color::YELLOW,
-    );
+            let points = [
+                rect.min,
+                Vec2::new(rect.min.x, rect.max.y),
+                rect.max,
+                Vec2::new(rect.max.x, rect.min.y),
+                rect.min,
+            ]
+            .map(|point| {
+                camera
+                    .viewport_to_world(camera_transform, point)
+                    .unwrap()
+                    .origin
+                    + camera_transform.forward() * 0.0001
+            });
+
+            gizmos.linestrip(points, Color::YELLOW);
+        }
+    }
 }
 
-fn rect_circle_intersect(rect: Rect, center: Vec2, radius: f32) -> bool {
-    let closest_point = center.clamp(rect.min, rect.max);
-    let distance = (center - closest_point).length();
-    distance < radius
+fn show_debug_shapes(selectables: Query<(&GlobalTransform, &Selectable)>, mut gizmos: Gizmos) {
+    for (transform, selectable) in selectables.iter() {
+        let position = transform.translation();
+        let offset_x = Vec3::X * selectable.size.x;
+        let offset_y = Vec3::Y * selectable.size.y;
+        let offset_z = Vec3::Z * selectable.size.z;
+        gizmos.linestrip(
+            [
+                position + offset_x + offset_y + offset_z,
+                position + offset_x + offset_y - offset_z,
+                position + offset_x - offset_y - offset_z,
+                position + offset_x - offset_y + offset_z,
+                position + offset_x + offset_y + offset_z,
+                position - offset_x + offset_y + offset_z,
+            ],
+            Color::GREEN,
+        );
+        gizmos.linestrip(
+            [
+                position - offset_x - offset_y - offset_z,
+                position - offset_x - offset_y + offset_z,
+                position - offset_x + offset_y + offset_z,
+                position - offset_x + offset_y - offset_z,
+                position - offset_x - offset_y - offset_z,
+                position + offset_x - offset_y - offset_z,
+            ],
+            Color::GREEN,
+        );
+
+        gizmos.line(
+            position + offset_x + offset_y - offset_z,
+            position - offset_x + offset_y - offset_z,
+            Color::GREEN,
+        );
+        gizmos.line(
+            position + offset_x - offset_y + offset_z,
+            position - offset_x - offset_y + offset_z,
+            Color::GREEN,
+        );
+    }
 }
